@@ -26,28 +26,33 @@ policy, hooks, and lifecycle controls on top.
 
 import os
 import subprocess
+import json
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+# Initialize OpenAI client with Silicon Flow
+client = OpenAI(
+    base_url=os.getenv("OPENAI_BASE_URL"),
+    api_key=os.getenv("OPENAI_API_KEY")
+)
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
 TOOLS = [{
-    "name": "bash",
-    "description": "Run a shell command.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"command": {"type": "string"}},
-        "required": ["command"],
-    },
+    "type": "function",
+    "function": {
+        "name": "bash",
+        "description": "Run a shell command.",
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string", "description": "The shell command to run"}},
+            "required": ["command"],
+        },
+    }
 }]
 
 
@@ -66,26 +71,51 @@ def run_bash(command: str) -> str:
 
 # -- The core pattern: a while loop that calls tools until the model stops --
 def agent_loop(messages: list):
+    # Prepare messages with system prompt
+    all_messages = [{"role": "system", "content": SYSTEM}] + messages
+    
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=all_messages,
+            tools=TOOLS,
+            max_tokens=8000,
         )
-        # Append assistant turn
-        messages.append({"role": "assistant", "content": response.content})
+        
+        # Get the assistant's message
+        assistant_msg = response.choices[0].message
+        
+        # Append assistant turn to both lists
+        assistant_content = {
+            "role": "assistant",
+            "content": assistant_msg.content or "",
+        }
+        if hasattr(assistant_msg, 'tool_calls') and assistant_msg.tool_calls:
+            assistant_content["tool_calls"] = assistant_msg.tool_calls
+        
+        all_messages.append(assistant_content)
+        messages.append(assistant_content)
+        
         # If the model didn't call a tool, we're done
-        if response.stop_reason != "tool_use":
+        if not (hasattr(assistant_msg, 'tool_calls') and assistant_msg.tool_calls):
             return
+        
         # Execute each tool call, collect results
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"\033[33m$ {block.input['command']}\033[0m")
-                output = run_bash(block.input["command"])
+        for tool_call in assistant_msg.tool_calls:
+            if tool_call.function.name == "bash":
+                command = json.loads(tool_call.function.arguments).get("command", "")
+                print(f"\033[33m$ {command}\033[0m")
+                output = run_bash(command)
                 print(output[:200])
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": output})
-        messages.append({"role": "user", "content": results})
+                
+                # Add tool result message
+                tool_result_msg = {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": output
+                }
+                all_messages.append(tool_result_msg)
+                messages.append(tool_result_msg)
 
 
 if __name__ == "__main__":
@@ -99,9 +129,9 @@ if __name__ == "__main__":
             break
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+        # Print assistant response
+        if history and history[-1]["role"] == "assistant":
+            content = history[-1]["content"]
+            if content:
+                print(content)
         print()
